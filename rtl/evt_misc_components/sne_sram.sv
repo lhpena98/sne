@@ -15,7 +15,7 @@
  * specific language governing permissions and limitations under the License.
  */
 
-`ifdef TARGET_TEST
+// `ifdef TARGET_TEST
 
   module sne_sram #(
 
@@ -56,10 +56,10 @@
 
     assign rdata_o = ram[raddr_q];
 
-`else
+// `else
 
     
 
-`endif    
+// `endif    
 endmodule
 

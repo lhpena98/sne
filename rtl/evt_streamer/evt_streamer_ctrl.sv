@@ -21,7 +21,9 @@ import sne_evt_stream_pkg::spike_t;
 import sne_evt_stream_pkg::EOP;
 import sne_evt_stream_pkg::config_system_sw_t;
 import sne_evt_stream_pkg::config_system_hw_t;
-#( parameter STREAMER_ID = 0)(
+#( parameter STREAMER_ID = 0,
+   parameter MAX_OUTSTANDING_REQUESTS = 4
+)(
 
   input  logic        system_clk_i          ,  
   input  logic        system_rst_ni         ,  
@@ -118,7 +120,11 @@ logic        weight_fetch_end, update_weight_addr;
 
 logic        cfg_store_check                     ;
 logic        cfg_set_interrupt                   ;
-logic [3:0]  cfg_interrupt_compare_value         ;                   
+logic [3:0]  cfg_interrupt_compare_value         ;        
+
+logic [31:0] outstanding_requests                ; //--- number of outstanding requests to the TCDM memory
+
+logic context_switching_active;
 
 //--- control signal binding
 assign cfg_main_ctrl_i            = config_i.reg2hw.cfg_main_ctrl_i[STREAMER_ID];
@@ -179,6 +185,7 @@ enum logic [3:0] {
   IDLE        ,
   LOAD        ,
   STREAM_IN   ,
+  WAIT_TCDM_RESPONSE,
   STREAM_PAUSE,
   STORE       ,
   STREAM_OUT  ,
@@ -236,7 +243,9 @@ always_comb begin : proc_NS
       end 
     end 
     STREAM_IN: begin
-      if(streamer_transfer_end_s && (weight_fetch_fc_q) && (evt_stream_src.ready)) begin 
+      if (tcdm_req_o && tcdm_gnt_i && tcdm_wen_o) begin
+        NS = WAIT_TCDM_RESPONSE;
+      end else if(streamer_transfer_end_s && (weight_fetch_fc_q) && (evt_stream_src.ready)) begin 
         NS = FC_TRANSFER_END;
       end else if(streamer_transfer_end_s && (evt_stream_src.ready) & (~weight_fetch_fc_q)) begin 
         NS = TRANSFER_END;
@@ -254,7 +263,26 @@ always_comb begin : proc_NS
         end
       end
     end
-
+    
+    WAIT_TCDM_RESPONSE: begin
+      if(tcdm_r_valid_i) begin
+        // First check transfer end conditions
+        if(streamer_transfer_end_s && (weight_fetch_fc_q)) begin 
+          NS = FC_TRANSFER_END;
+        end else if(streamer_transfer_end_s && (~weight_fetch_fc_q)) begin 
+          NS = TRANSFER_END;
+        // Then check for time/EOP events
+        end else if((tcdm_r_data_i[31:28]==EVT_TIME || tcdm_r_data_i[31:28]==EOP) && 
+          cfg_context_switch_mode_i && (~weight_fetch_fc_q)) begin
+          NS = POP_NEXT_STATE;
+        end else begin
+          NS = STREAM_IN;
+        end
+      end else begin
+        NS = WAIT_TCDM_RESPONSE;
+      end
+    end
+    
     FC_STORE_CURRENT_STATE : begin
       NS = STREAM_IN; 
     end
@@ -319,6 +347,26 @@ always_comb begin : proc_NS
   endcase
 end
 
+assign context_switching_active = (PS == POP_NEXT_STATE || PS == PUSH_CURRENT_STATE);
+
+// Track outstanding requests (increment on request, decrement on response)
+always_ff @(posedge system_clk_i or negedge system_rst_ni) begin
+  if(~system_rst_ni) begin
+    outstanding_requests <= '0;
+  end else begin
+    // Increment when request is sent and granted
+    if (tcdm_req_o && tcdm_gnt_i && !tcdm_r_valid_i) begin
+      outstanding_requests <= outstanding_requests + 1;
+    // Decrement when response is received
+    end else if (!tcdm_req_o && tcdm_r_valid_i && outstanding_requests > 0) begin
+      outstanding_requests <= outstanding_requests - 1;
+    // Both happen in same cycle
+    end else if (tcdm_req_o && tcdm_gnt_i && tcdm_r_valid_i) begin
+      outstanding_requests <= outstanding_requests;
+    end
+  end
+end
+
 always_comb begin : proc_outputs
   
   pop_enable           = 0                   ;
@@ -362,14 +410,32 @@ always_comb begin : proc_outputs
     end
 
     STREAM_IN   : begin
-      streamer_raddr_step_en_s  = 1'b1;
+      if (outstanding_requests < MAX_OUTSTANDING_REQUESTS && evt_stream_src.ready) begin
+        streamer_raddr_step_en_s  = 1'b1;
+      end else begin
+        streamer_raddr_step_en_s  = 1'b0;
+      end
+      // streamer_raddr_step_en_s  = 1'b1;
       streamer_waddr_step_en_s  = 1'b0;
       streamer_tcdm_addr_init_s = 1'b0;
       tcdm_wen_o                = 1'b1;
       pause_valid_s             = 1'b0;
       spike_id_d                = evt_stream_src.evt;
-      latch_tcdm_address_d      = tcdm_address_s;
+      if (streamer_transfer_end_s) begin
+        latch_tcdm_address_d = tcdm_address_s;
+      end else begin
+        latch_tcdm_address_d = latch_tcdm_address_q; // Hold current value
+      end
       //sta_main_status_o = 32'h00000010;
+    end
+
+    WAIT_TCDM_RESPONSE: begin
+      // In this state, we are waiting. Do not issue new requests.
+      streamer_raddr_step_en_s  = 1'b0;
+      streamer_waddr_step_en_s  = 1'b0;
+      streamer_tcdm_addr_init_s = 1'b0;
+      tcdm_wen_o                = 1'b1; // Keep indicating a read operation
+      pause_valid_s             = 1'b0;
     end
 
     FIFO_INIT   : begin
@@ -475,7 +541,11 @@ end
 
 //--- request is asserted both during reading and writing of the TCDM memory
 //--- request generation condition: during tcdm writing, forward the ready signal as request, otherwise, during reading forward the valid signal as request--reading to initialize the context_switch fifo as well as the cdc fifo.
-assign tcdm_req_o                     = (evt_stream_src.ready && streamer_raddr_step_en_s) || (evt_stream_dst.valid && streamer_waddr_step_en_s) || (cfg_context_fifo_init_i && streamer_raddr_step_en_s);
+//--- adding context_switching condition
+assign tcdm_req_o = context_switching_active ? 1'b0 : 
+                     (evt_stream_src.ready && streamer_raddr_step_en_s) || 
+                     (evt_stream_dst.valid && streamer_waddr_step_en_s) || 
+                     (cfg_context_fifo_init_i && streamer_raddr_step_en_s);
 
 //--- during tcdm writing, after the request is placed by the src valid signal, we use the TCDM grant as ready for the src fifo
 assign evt_stream_dst.ready           = tcdm_gnt_i && streamer_waddr_step_en_s;
@@ -502,7 +572,8 @@ assign address_rw_step_en_s           = address_w_step_en_s || address_r_step_en
 
 //--- criteria for transaction end detection
 assign end_addr_based_transfer_end_s  = (tcdm_address_s >= (cfg_tcdm_end_addr_i)) && streamer_tran_end_mode_s             ; //--- end transaction when end address is reached
-assign tran_size_based_transfer_end_s = ((weight_fetch_fc_q && (tcdm_transaction_counter_s == cfg_fc_tran_size_i))||((tcdm_transaction_counter_s == cfg_tcdm_tran_size_i)))&& ~streamer_tran_end_mode_s ; //--- end transaction when transaction size is reached
+assign tran_size_based_transfer_end_s = ((weight_fetch_fc_q && (tcdm_transaction_counter_s > cfg_fc_tran_size_i))||
+                                        ((tcdm_transaction_counter_s > cfg_tcdm_tran_size_i)))&& ~streamer_tran_end_mode_s; //--- end transaction when transaction size is reached
 assign streamer_transfer_end_s        = (end_addr_based_transfer_end_s || tran_size_based_transfer_end_s || end_context_switch ||end_fc||store_end_q); //--- global condition
 assign sta_trans_ptr_o                = streamer_ptr_sel_s ? tcdm_address_s : tcdm_transaction_counter_s                  ; //--- expose either the address or the iteration on the status reg
 
@@ -511,8 +582,12 @@ always_ff @(posedge system_clk_i or negedge system_rst_ni) begin : proc_tcdm_add
     tcdm_address_s             <= 0;
     tcdm_transaction_counter_s <= 0;
   end else begin
-    if(push_enable) begin 
-      tcdm_address_s             <= next_context_address      ;
+    if(context_switching_active) begin
+      // During context switching, maintain the current address to prevent X propagation
+      tcdm_address_s             <= tcdm_address_s;
+      tcdm_transaction_counter_s <= tcdm_transaction_counter_s;
+    end else if(push_enable) begin 
+      tcdm_address_s             <= next_context_address;
       tcdm_transaction_counter_s <= tcdm_transaction_counter_s;
     end else if(update_weight_addr) begin 
       tcdm_address_s             <= spike_decoded_address     ;
