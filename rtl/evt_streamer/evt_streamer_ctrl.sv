@@ -544,7 +544,7 @@ end
 //--- adding context_switching condition
 assign tcdm_req_o = context_switching_active ? 1'b0 : 
                      (evt_stream_src.ready && streamer_raddr_step_en_s) || 
-                     (evt_stream_dst.valid && streamer_waddr_step_en_s) || 
+                     (evt_stream_dst.valid && streamer_waddr_step_en_s) ||  //THIS SHOULD BE 1, streamer_waddr_step_en_s is 1 but not evt_stream_dst.valid why???
                      (cfg_context_fifo_init_i && streamer_raddr_step_en_s);
 
 //--- during tcdm writing, after the request is placed by the src valid signal, we use the TCDM grant as ready for the src fifo
